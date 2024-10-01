@@ -13,41 +13,31 @@ public struct RawRepresentableMacro: MemberMacro, ExtensionMacro {
         let rawValueType = parseRawValue(for: node)
         
         guard let enumDecl = declaration.as(EnumDeclSyntax.self) else {
-            throw Error.notAnEnum(for: declaration).diagnostic
+            throw DiagnosticsError(.notAnEnum(for: declaration))
         }
         
-        let caseName: String
-        if let arguments = node.arguments {
-            let expr = arguments.cast(LabeledExprListSyntax.self).first!.expression
-            guard let name = expr.as(StringLiteralExprSyntax.self)?.representedLiteralValue else {
-                throw Error.caseNameLiteral(for: expr).diagnostic
-            }
-            caseName = name
-        } else {
-            caseName = "unknown"
-        }
+        let (defaultCase, otherCases) = try parseCases(
+            in: enumDecl,
+            rawValueType: rawValueType
+        )
         
-        guard let (defaultCase, otherCases) = parseCases(defaultCase: caseName, in: enumDecl) else {
-            throw Error.missingDefaultCase(name: caseName, rawValueType: rawValueType, for: enumDecl).diagnostic
-        }
+        var errors: [Error] = []
         
-        guard let params = defaultCase.parameterClause?.parameters,
-              params.count == 1,
-              let associatedValueType = params.first?.type.as(IdentifierTypeSyntax.self),
-              rawValueType.name.text == associatedValueType.name.text
-        else {
-            throw Error.wrongAssociatedValue(rawValueType: rawValueType, for: defaultCase).diagnostic
-        }
-
-        let casesAndValues: [(name: String, value: ExprSyntax)] = try otherCases.map { item in
-            let name = item.name.trimmed.text
-            if let rawValue = item.rawValue?.value {
+        let casesAndValues: [(name: String, value: Syntax)] = otherCases.compactMap { item in
+            let name = item.node.name.trimmed.text
+            
+            if let rawValue = item.rawValue {
                 return (name, rawValue)
             } else if rawValueType.name.text == "String" {
-                return (name, "\"\(raw: item.name.text)\"")
+                return (name, Syntax("\"\(raw: name)\"" as ExprSyntax))
             } else {
-                throw MacroExpansionErrorMessage("No raw value for case \(name)")
+                errors.append(.missingRawValue(for: item, in: enumDecl))
+                return nil
             }
+        }
+        
+        if !errors.isEmpty {
+            throw DiagnosticsError(diagnostics: errors.map(\.diagnostic))
         }
         
         let initCases = casesAndValues.map {
@@ -64,7 +54,7 @@ public struct RawRepresentableMacro: MemberMacro, ExtensionMacro {
                 self = switch rawValue {
                 \(raw: initCases)
                 default:
-                    .\(raw: caseName)(rawValue)
+                    .\(raw: defaultCase.name.trimmed)(rawValue)
                 }
             }
             """,
@@ -72,7 +62,7 @@ public struct RawRepresentableMacro: MemberMacro, ExtensionMacro {
             var rawValue: \(raw: rawValueType.name.text) {
                 switch self {
                 \(raw: rawValueCases)
-                case .\(raw: caseName)(let value):
+                case .\(raw: defaultCase.name.trimmed)(let value):
                     value
                 }
             }
@@ -89,90 +79,137 @@ public struct RawRepresentableMacro: MemberMacro, ExtensionMacro {
         return attrGenerics.first!.argument.cast(IdentifierTypeSyntax.self)
     }
     
-    private static func parseCases(defaultCase defaultCaseName: String, in enumDecl: EnumDeclSyntax) -> (defaultCase: EnumCaseElementSyntax, otherCases: [EnumCaseElementSyntax])? {
+    typealias CaseInfo = (node: EnumCaseElementSyntax, case: EnumCaseDeclSyntax, rawValue: Syntax?)
+    
+    private static func parseCases(in enumDecl: EnumDeclSyntax, rawValueType: IdentifierTypeSyntax) throws -> (defaultCase: EnumCaseElementSyntax, otherCases: [CaseInfo]) {
         var defaultCase: EnumCaseElementSyntax?
-        var otherCases: [EnumCaseElementSyntax] = []
+        var otherCases: [CaseInfo] = []
         
-        for item in enumDecl.memberBlock.members {
-            for caseDecl in item.decl.cast(EnumCaseDeclSyntax.self).elements {
-                if caseDecl.name.trimmed.text == defaultCaseName {
-                    defaultCase = caseDecl
-                } else {
-                    otherCases.append(caseDecl)
-                }
+        func isValidDefault(_ element: EnumCaseElementSyntax) -> Bool {
+            if let params = element.parameterClause?.parameters,
+                      params.count == 1,
+                      let associatedValueType = params.first!.type.as(IdentifierTypeSyntax.self),
+                      rawValueType.name.text == associatedValueType.name.text
+            {
+                return true
+            } else {
+                return false
             }
         }
         
-        guard let defaultCase else { return nil }
+        var errors: [Error] = []
         
+        // check each case looking for relevant attributes
+        for item in enumDecl.memberBlock.members {
+            let caseDecl = item.decl.cast(EnumCaseDeclSyntax.self)
+            
+            if caseDecl.attribute(named: "DefaultCase") != nil {
+                // if there are multiple case names on one line, assume the attribute applies to the first
+                let first = caseDecl.elements.first!
+                
+                if let defaultCase {
+                    // diagnose 2nd+ usage of DefaultCase
+                    errors.append(.extraDefaultCase(for: first, existing: defaultCase))
+                } else {
+                    // record first usage of DefaultCase
+                    defaultCase = first
+                    // diagnose if there's something wrong with it (too few/too many/wrong associated value)
+                    if !isValidDefault(first) {
+                        errors.append(.wrongAssociatedValue(rawValueType: rawValueType, for: first))
+                    }
+                }
+                
+                // diagnose a value having both DefaultCase and RawValue
+                if caseDecl.attribute(named: "RawValue") != nil {
+                    errors.append(.defaultAndRaw(for: first))
+                }
+                
+                // any other cases on this line are assumed to have no attributes
+                for item in caseDecl.elements.dropFirst() {
+                    otherCases.append((item, caseDecl, nil))
+                }
+            } else if let attribute = caseDecl.attribute(named: "RawValue") {
+                // if there are multiple case names on one line, assume the attribute applies to the first
+                let first = caseDecl.elements.first!
+                // raw value should be the single argument
+                let rawValue = attribute.arguments!.cast(LabeledExprListSyntax.self).first!.expression
+                
+                otherCases.append((first, caseDecl, Syntax(rawValue)))
+                
+                // any other cases on this line are assumed to have no attributes (and therefore no raw value)
+                for item in caseDecl.elements.dropFirst() {
+                    otherCases.append((item, caseDecl, nil))
+                }
+            } else {
+                // for a case declaration with no attributes, just add all the cases
+                otherCases.append(contentsOf: caseDecl.elements.map { ($0, caseDecl, nil) })
+            }
+        }
+
+        // diagnose duplicate raw values
+        var rawValues: [String: Syntax] = [:]
+        
+        for other in otherCases {
+            guard let rawValue = other.rawValue else { continue }
+            
+            let stringValue = "\(rawValue)"
+            if let existing = rawValues[stringValue] {
+                errors.append(.duplicateRawValues(for: rawValue, existing: existing))
+            } else {
+                rawValues[stringValue] = rawValue
+            }
+        }
+        
+        // if we don't have a default case, diagnose it along with any gathered errors
+        guard let defaultCase else {
+            let candidate = otherCases.first(where: { isValidDefault($0.node) })
+            errors.append(.missingDefaultCase(
+                rawValueType: rawValueType,
+                for: enumDecl,
+                candidate: candidate?.case
+            ))
+            throw DiagnosticsError(diagnostics: errors.map(\.diagnostic))
+        }
+        
+        // diagnose any errors we gathered
+        if !errors.isEmpty {
+            throw DiagnosticsError(diagnostics: errors.map(\.diagnostic))
+        }
+        
+        // otherwise, everything should be ok
         return (defaultCase, otherCases)
     }
     
-    struct Error: Swift.Error, DiagnosticMessage {
-        let diagnosticID: MessageID
-        let message: String
-        let severity: DiagnosticSeverity
-        let node: any SyntaxProtocol
-        let fixIts: [FixIt]
-        
-        init(id: String, message: String, severity: DiagnosticSeverity = .error, node: some SyntaxProtocol, fixIts: [FixIt] = []) {
-            self.diagnosticID = .init(domain: "com.jayrhynas.defaultcase", id: id)
-            self.message = message
-            self.severity = severity
-            self.node = node
-            self.fixIts = fixIts
-        }
-        
-        struct Fix: FixItMessage {
-            let message: String
-            let fixItID: SwiftDiagnostics.MessageID
-            
-            init(id: String, message: String) {
-                self.message = message
-                self.fixItID = .init(domain: "com.jayrhynas.defaultcase", id: id)
-            }
-            
-            static let addDefaultCase = Fix(id: "addDefaultCase", message: "Add default case")
-            static let fixAssociatedValue = Fix(id: "fixAssociatedValue", message: "Fix associated value")
-        }
-        
-        var diagnostic: DiagnosticsError {
-            DiagnosticsError(diagnostics: [.init(node: node, message: self, fixIts: fixIts)])
-        }
-        
-        static func notAnEnum(for decl: some DeclGroupSyntax) -> Self {
-            .init(id: "notAnEnum", message: "@DefaultCase can only be applied to enums", node: decl)
-        }
-        
-        static func caseNameLiteral(for expr: ExprSyntax) -> Self {
-            .init(id: "caseNameLiteral", message: "`caseName` must be a string literal", node: expr)
-        }
+}
 
-        static func missingDefaultCase(name: String, rawValueType: IdentifierTypeSyntax, for node: EnumDeclSyntax) -> Self {
-            var newMembers = node.memberBlock
-            newMembers.members.append(
-                .init(leadingTrivia: .newline, decl: ("case \(raw: name)(\(rawValueType))" as DeclSyntax).cast(EnumCaseDeclSyntax.self))
-            )
-            return .init(id: "missingDefaultCase", message: "No `case \(name)(\(rawValueType.name.trimmed))` in enum", node: node.name, fixIts: [
-                .replace(message: Fix.addDefaultCase, oldNode: node.memberBlock, newNode: newMembers)
-            ])
-        }
-        
-        static func wrongAssociatedValue(rawValueType: IdentifierTypeSyntax, for node: EnumCaseElementSyntax) -> Self {
-            var newNode = node
-            newNode.parameterClause = .init(parameters: [.init(type: rawValueType)])
-            
-            return .init(id: "noAssociatedValue", message: "`case \(node.name.trimmed)` must have exactly one associated value of type `\(rawValueType)`", node: node, fixIts: [
-                .replace(message: Fix.fixAssociatedValue, oldNode: node, newNode: newNode)
-            ])
-        }
+extension EnumCaseDeclSyntax {
+    func attribute(named: String) -> AttributeSyntax? {
+        self.attributes.lazy.compactMap {
+            guard let attr = $0.as(AttributeSyntax.self) else {
+                return nil
+            }
+            return attr.attributeName.cast(IdentifierTypeSyntax.self).name.trimmed.text == named ? attr : nil
+        }.first
     }
-    
+}
+
+public struct RawValueMacro: PeerMacro {
+    public static func expansion(of node: AttributeSyntax, providingPeersOf declaration: some DeclSyntaxProtocol, in context: some MacroExpansionContext) throws -> [DeclSyntax] {
+        []
+    }
+}
+
+public struct DefaultCaseMacro: PeerMacro {
+    public static func expansion(of node: AttributeSyntax, providingPeersOf declaration: some DeclSyntaxProtocol, in context: some MacroExpansionContext) throws -> [DeclSyntax] {
+        []
+    }
 }
 
 @main
 struct RawRepresentableEnumPlugin: CompilerPlugin {
     let providingMacros: [Macro.Type] = [
         RawRepresentableMacro.self,
+        RawValueMacro.self,
+        DefaultCaseMacro.self
     ]
 }

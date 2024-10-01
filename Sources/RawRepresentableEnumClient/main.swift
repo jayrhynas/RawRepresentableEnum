@@ -1,16 +1,11 @@
 import RawRepresentableEnum
 
-@RawRepresentable<String>
+@RawRepresentable<Int>
 enum Foo {
+    @RawValue(1)
     case a
+    @RawValue(2)
     case b
-    case unknown(String)
+    @DefaultCase
+    case unknown(Int)
 }
-
-print(Foo(rawValue: "a"))
-print(Foo(rawValue: "b"))
-print(Foo(rawValue: "test"))
-
-print(Foo.a.rawValue)
-print(Foo.b.rawValue)
-print(Foo.unknown("test").rawValue)
